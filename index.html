@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Osobní cloud Nextcloud na třech virtuálech – projekt Virtualizace II</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<a class="skip-link" href="#obsah">Přeskočit na obsah</a>
+
+<header class="hero">
+    <div class="hero-text">
+        <p class="hero-course">Semestrální projekt, Virtualizace II</p>
+        <h1>Osobní cloud Nextcloud s odděleným renderováním dokumentů</h1>
+        <p class="hero-lead">
+            Podnikové sdílení souborů rozdělené na tři virtuály: aplikace s reverzní proxy,
+            backend s databází, Redisem a antivirem a samostatný stroj pro online kancelář
+            Collabora. Virtuály spolu komunikují výhradně přes šifrovanou VPN WireGuard.
+        </p>
+    </div>
+
+    <aside class="host-card" aria-label="Stav nasazení">
+        <div class="host-card-head">
+            <span class="host-name">cloud.nextcloud.test</span>
+            <span class="badge badge-ok" title="Dostupné přes HTTPS">HTTPS</span>
+        </div>
+        <dl class="host-facts">
+            <div><dt>VM1</dt><dd>Nextcloud 34, Caddy<span class="vm-ip">100.64.0.1</span></dd></div>
+            <div><dt>VM2</dt><dd>MariaDB 11.4, Redis 7, ClamAV<span class="vm-ip">100.64.0.2</span></dd></div>
+            <div><dt>VM3</dt><dd>Collabora Online 26.04<span class="vm-ip">100.64.0.3</span></dd></div>
+            <div><dt>Systém</dt><dd>Ubuntu 24.04.5 LTS, Docker</dd></div>
+        </dl>
+        <p class="host-status"><span class="dot dot-ok" aria-hidden="true"></span> Všechny tři virtuály v tunelu, služby běží</p>
+    </aside>
+</header>
+
+<div class="layout">
+
+<nav class="toc" aria-label="Obsah prezentace">
+    <p class="toc-title">Obsah</p>
+    <ol>
+        <li><a href="#uvod">Zadání a cíl</a></li>
+        <li><a href="#architektura">Architektura</a></li>
+        <li><a href="#priprava">Příprava virtuálů</a></li>
+        <li><a href="#vpn">VPN WireGuard</a></li>
+        <li><a href="#backend">Backend na VM2</a></li>
+        <li><a href="#nextcloud">Nextcloud a Caddy</a></li>
+        <li><a href="#antivir">Antivirová kontrola</a></li>
+        <li><a href="#collabora">Collabora na VM3</a></li>
+        <li><a href="#testy">Testy</a></li>
+        <li><a href="#problemy">Problémy a řešení</a></li>
+        <li><a href="#rozsireni">Možná rozšíření</a></li>
+        <li><a href="#zaver">Závěr</a></li>
+    </ol>
+</nav>
+
+<main id="obsah">
+
+<section id="uvod">
+    <h2>Zadání a cíl projektu</h2>
+    <p>
+        Scénář zadání je podnikové sdílení souborů, ve kterém je oddělený běh aplikace, běh
+        databáze a výpočetně náročné renderování online kanceláře. Každá vrstva proto běží
+        na vlastním virtuálu:
+    </p>
+    <ul>
+        <li><strong>VM1, web a aplikace:</strong> Nextcloud (Apache + PHP) a reverzní proxy Caddy s HTTPS,</li>
+        <li><strong>VM2, backend:</strong> MariaDB, Redis pro zamykání souborů a ClamAV pro antivirovou kontrolu,</li>
+        <li><strong>VM3, renderování dokumentů:</strong> Collabora Online (CODE).</li>
+    </ul>
+    <p>Hlavní složitost zadání je v propojení vrstev:</p>
+    <ul>
+        <li>Nextcloud na VM1 musí každý nahraný soubor poslat přes VPN na VM2 k antivirové kontrole,</li>
+        <li>při otevření tabulky musí uživatele spojit s renderovacím jádrem Collabora na VM3,</li>
+        <li>Redis musí zabránit kolizím, když se stejným souborem pracuje víc lidí najednou.</li>
+    </ul>
+</section>
+
+<section id="architektura">
+    <h2>Architektura a prostředí</h2>
+    <p>
+        Všechny služby běží v kontejnerech Dockeru. Ven je vystavená jen VM1 s Caddy na portech
+        80 a 443. Backend i Collabora poslouchají výhradně na adresách tunelu WireGuard, takže
+        nejsou dostupné ani ze školní sítě.
+    </p>
+
+    <figure class="diagram topo" aria-label="Schéma tří virtuálů">
+        <div class="topo-center">
+            <div class="node">
+                <span class="node-title">Prohlížeč na notebooku</span>
+                <span class="node-sub">školní VPN, /etc/hosts, důvěra v CA Caddy</span>
+            </div>
+        </div>
+        <div class="vlink"><span class="vlink-label">HTTPS 443 přes IPv6</span></div>
+        <div class="topo-center">
+            <div class="node node-brand">
+                <span class="node-title">VM1, web a aplikace</span>
+                <span class="node-sub">100.64.0.1</span>
+                <ul class="node-stack">
+                    <li>Caddy :443 → cloud. a office.nextcloud.test</li>
+                    <li>Nextcloud 34 (Apache, PHP 8.5)</li>
+                    <li>cron pro úlohy na pozadí</li>
+                </ul>
+            </div>
+        </div>
+        <div class="topo-pair">
+            <div class="topo-branch">
+                <div class="vlink"><span class="vlink-label">WireGuard: SQL, Redis, AV</span></div>
+                <div class="node node-vm">
+                    <span class="node-title">VM2, backend</span>
+                    <span class="node-sub">100.64.0.2</span>
+                    <ul class="node-stack">
+                        <li>MariaDB 11.4 :3306</li>
+                        <li>Redis 7 :6379</li>
+                        <li>ClamAV clamd :3310</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="topo-branch">
+                <div class="vlink"><span class="vlink-label">WireGuard: dokumenty, WOPI</span></div>
+                <div class="node node-vm">
+                    <span class="node-title">VM3, renderování</span>
+                    <span class="node-sub">100.64.0.3</span>
+                    <ul class="node-stack">
+                        <li>Collabora CODE :9980</li>
+                        <li>bez vlastního TLS</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <figcaption>
+            Schéma: prohlížeč komunikuje jen s Caddy na VM1. Caddy předává provoz Nextcloudu
+            a přes tunel Collaboře. Nextcloud volá databázi, Redis a antivirus na VM2,
+            Collabora si přes tunel stahuje a ukládá dokumenty z Nextcloudu.
+        </figcaption>
+    </figure>
+
+    <h3>Přidělené virtuály a adresy</h3>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr><th scope="col">Virtuál</th><th scope="col">IPv6 (přístup)</th><th scope="col">IPv4 (endpoint VPN)</th><th scope="col">Tunel</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>VM1 (č. 42)</td><td>2001:718:1001:2cf:20c:29ff:fe15:a285</td><td>192.168.0.204</td><td>100.64.0.1</td></tr>
+                <tr><td>VM2 (č. 43)</td><td>2001:718:1001:2cf:20c:29ff:fefc:b0ef</td><td>192.168.0.229</td><td>100.64.0.2</td></tr>
+                <tr><td>VM3 (č. 44)</td><td>2001:718:1001:2cf:20c:29ff:fedc:7147</td><td>192.168.0.230</td><td>100.64.0.3</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3>Použité komponenty</h3>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr><th scope="col">Součást</th><th scope="col">Verze</th><th scope="col">Úloha</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Operační systém</td><td>Ubuntu Server 24.04.5 LTS</td><td>základ všech tří virtuálů</td></tr>
+                <tr><td>Docker, Compose</td><td>Docker CE 29, Compose 5.5</td><td>běh služeb v kontejnerech</td></tr>
+                <tr><td>WireGuard</td><td>jádro Linuxu 6.8</td><td>šifrovaná síť mezi virtuály</td></tr>
+                <tr><td>Nextcloud</td><td>34.0.4 (Hub 26 Spring)</td><td>aplikace pro sdílení souborů</td></tr>
+                <tr><td>Caddy</td><td>2</td><td>reverzní proxy, automatické certifikáty</td></tr>
+                <tr><td>MariaDB</td><td>11.4.13</td><td>databáze Nextcloudu</td></tr>
+                <tr><td>Redis</td><td>7</td><td>zamykání souborů, cache, PHP session</td></tr>
+                <tr><td>ClamAV</td><td>stable</td><td>antivirová kontrola nahraných souborů</td></tr>
+                <tr><td>Collabora Online</td><td>CODE 26.04.4.2</td><td>renderování a editace dokumentů</td></tr>
+                <tr><td>Aplikace Nextcloudu</td><td>files_antivirus 6.4.1, richdocuments 11.1.2</td><td>napojení na ClamAV a Collaboru</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section id="priprava">
+    <h2>Příprava virtuálů</h2>
+    <p>Na všech třech virtuálech proběhl stejný základ.</p>
+
+    <ol class="steps">
+        <li>
+            <h3>Aktualizace a základní balíčky</h3>
+<pre><code>sudo hostnamectl set-hostname VM1        # VM2, VM3
+sudo apt update &amp;&amp; sudo apt full-upgrade -y
+sudo apt install -y curl ca-certificates gnupg ufw wireguard tmux
+sudo timedatectl set-timezone Europe/Prague</code></pre>
+        </li>
+        <li>
+            <h3>Docker z oficiálního repozitáře</h3>
+<pre><code>curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu noble stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo usermod -aG docker $USER</code></pre>
+            <p>Po instalaci následoval restart kvůli novému jádru a členství ve skupině <code>docker</code>.</p>
+        </li>
+        <li>
+            <h3>Firewall</h3>
+<pre><code>sudo ufw allow 22/tcp
+sudo ufw allow 51820/udp
+sudo ufw allow in on wg0
+sudo ufw enable</code></pre>
+            <p>Na VM1 navíc přibyly porty <code>80/tcp</code> a <code>443/tcp</code> pro Caddy.</p>
+        </li>
+    </ol>
+</section>
+
+<section id="vpn">
+    <h2>VPN WireGuard mezi virtuály</h2>
+    <p>
+        Virtuály tvoří plnou síť (mesh): každý zná oba ostatní. Pro adresy uvnitř tunelu
+        jsem zvolil rozsah <code>100.64.0.0/24</code>. Původně plánovaný rozsah
+        <code>10.10.0.0/24</code> by spadal do sítě <code>10.0.0.0/8</code>, kterou mají
+        VM1 a VM2 na rozhraní <code>ens224</code>.
+    </p>
+
+    <h3>Konfigurace na VM1</h3>
+<pre><code># /etc/wireguard/wg0.conf
+[Interface]
+Address = 100.64.0.1/24
+ListenPort = 51820
+PostUp = wg set %i private-key /etc/wireguard/private.key
+
+[Peer]
+# VM2 backend
+PublicKey = &lt;veřejný klíč VM2&gt;
+Endpoint = 192.168.0.229:51820
+AllowedIPs = 100.64.0.2/32
+PersistentKeepalive = 25
+
+[Peer]
+# VM3 office
+PublicKey = &lt;veřejný klíč VM3&gt;
+Endpoint = 192.168.0.230:51820
+AllowedIPs = 100.64.0.3/32
+PersistentKeepalive = 25</code></pre>
+    <p>
+        Privátní klíč se načítá ze souboru přes <code>PostUp</code>, v konfiguraci tedy
+        není a dá se bezpečně ukázat. VM2 a VM3 mají obdobnou konfiguraci.
+    </p>
+
+    <h3>Docker startuje až po tunelu</h3>
+    <p>
+        Kontejnery publikují porty přímo na adresu tunelu (např. <code>100.64.0.2:3306</code>).
+        Ta existuje, až když běží WireGuard, proto má Docker na tunelu závislost:
+    </p>
+<pre><code># /etc/systemd/system/docker.service.d/wg.conf
+[Unit]
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service</code></pre>
+    <aside class="callout">
+        <p>
+            Závislost funguje oběma směry: pokud WireGuard spadne nebo se restartuje,
+            systemd zastaví i Docker. Bez tunelu by kontejnery stejně neměly kam navázat porty.
+        </p>
+    </aside>
+    <figure class="shot">
+        <img src="img/wg-show.png" alt="Výstup wg show s aktivním handshakem k oběma peerům" class="zoomable" loading="lazy">
+        <figcaption>Tunel na všech virtuálech, handshake s oběma peery</figcaption>
+    </figure>
+</section>
+
+<section id="backend">
+    <h2>Backend na VM2</h2>
+    <p>
+        MariaDB, Redis a ClamAV běží v jednom compose souboru. Všechny porty jsou publikované
+        jen na adrese <code>100.64.0.2</code>. Docker totiž obchází pravidla UFW, takže
+        navázání na konkrétní adresu je jediná spolehlivá ochrana před přístupem zvenku.
+    </p>
+<pre><code># /opt/backend/docker-compose.yml
+services:
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    command: --transaction-isolation=READ-COMMITTED --log-bin=binlog --binlog-format=ROW
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: nextcloud
+      MARIADB_USER: nextcloud
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - db:/var/lib/mysql
+    ports:
+      - "100.64.0.2:3306:3306"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redis:/data
+    ports:
+      - "100.64.0.2:6379:6379"
+
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    volumes:
+      - clamav:/var/lib/clamav
+    ports:
+      - "100.64.0.2:3310:3310"
+
+volumes:
+  db:
+  redis:
+  clamav:</code></pre>
+    <p>
+        Hesla jsou v souboru <code>.env</code> s právy <code>600</code>. Parametry MariaDB
+        (izolace transakcí a binlog ve formátu ROW) doporučuje dokumentace Nextcloudu.
+    </p>
+
+    <h3>Ověření z VM1 přes tunel</h3>
+<pre><code>mysql -h 100.64.0.2 -u nextcloud -p -e "SELECT VERSION();"   # 11.4.13-MariaDB
+redis-cli -h 100.64.0.2 -a '&lt;heslo&gt;' PING                     # PONG
+printf 'nPING\n' | nc -q 2 100.64.0.2 3310                      # PONG
+
+# negativní test: mimo tunel se na služby dostat nesmí
+nc -zv -w 3 192.168.0.229 3306    # timed out
+nc -zv -w 3 192.168.0.229 6379    # timed out</code></pre>
+    <figure class="shot">
+        <img src="img/backend-test.png" alt="Odpovědi MariaDB, Redisu a ClamAV přes tunel a timeout mimo tunel" class="zoomable" loading="lazy">
+        <figcaption>Služby odpovídají jen v tunelu</figcaption>
+    </figure>
+
+    <h3>Zátěž backendu</h3>
+    <p>
+        Nejvíc paměti na VM2 spotřebuje ClamAV, který drží celou databázi virových signatur
+        v RAM: zhruba 950 MiB, tedy téměř polovinu paměti virtuálu. MariaDB si vezme kolem
+        120 MiB a Redis jen 7 MiB. Při dimenzování backendu je proto rozhodující právě antivirus.
+    </p>
+    <figure class="shot">
+        <img src="img/backend-stats.png" alt="Výstup docker stats na VM2 s kontejnery Redis, MariaDB a ClamAV" class="zoomable" loading="lazy">
+        <figcaption>docker stats na VM2</figcaption>
+    </figure>
+</section>
+
+<section id="nextcloud">
+    <h2>Nextcloud a Caddy na VM1</h2>
+
+    <h3>Certifikát bez veřejné domény</h3>
+    <p>
+        Let's Encrypt vydá certifikát jen pro veřejnou doménu, kterou ověří z internetu.
+        Virtuály jsou dostupné jen přes školní VPN a nemají DNS záznamy, proto jsem použil
+        interní certifikační autoritu Caddy (<code>tls internal</code>). Certifikáty vydává
+        a obnovuje automaticky stejně jako u Let's Encrypt, v produkci by stačilo odebrat
+        jeden řádek. Jména <code>cloud.nextcloud.test</code> a <code>office.nextcloud.test</code>
+        jsou definovaná v <code>/etc/hosts</code> na notebooku a kořenový certifikát Caddy
+        je přidaný mezi důvěryhodné.
+    </p>
+
+    <ol class="steps">
+        <li>
+            <h3>Compose s Nextcloudem, cronem a Caddy</h3>
+<pre><code># /opt/nextcloud/docker-compose.yml (zkráceno)
+services:
+  nextcloud:
+    image: nextcloud:stable-apache
+    environment:
+      MYSQL_HOST: 100.64.0.2
+      REDIS_HOST: 100.64.0.2
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: cloud.nextcloud.test
+      OVERWRITEPROTOCOL: https
+      TRUSTED_PROXIES: 172.20.0.0/24
+    volumes: [nextcloud:/var/www/html]
+
+  cron:
+    image: nextcloud:stable-apache
+    entrypoint: /cron.sh
+
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    networks:
+      web:
+        aliases: [cloud.nextcloud.test, office.nextcloud.test]</code></pre>
+            <p>
+                Nastavení <code>REDIS_HOST</code> zapne Redis pro zamykání souborů i cache.
+                Síťové aliasy u Caddy zajistí, že Nextcloud uvnitř Dockeru najde vlastní
+                doménu i doménu Collabory, i když neexistuje DNS.
+            </p>
+        </li>
+        <li>
+            <h3>Caddyfile</h3>
+<pre><code>cloud.nextcloud.test {
+    tls internal
+    reverse_proxy nextcloud:80
+    header Strict-Transport-Security "max-age=15552000;"
+    redir /.well-known/carddav /remote.php/dav/ 301
+    redir /.well-known/caldav /remote.php/dav/ 301
+}
+
+office.nextcloud.test {
+    tls internal
+    reverse_proxy 100.64.0.3:9980
+}</code></pre>
+        </li>
+        <li>
+            <h3>Instalace a kontrola</h3>
+            <p>Nextcloud se při prvním startu sám nainstaloval do databáze na VM2.</p>
+<pre><code>occ status                                # installed: true, version 34.0.4.1
+occ config:system:get memcache.locking    # \OC\Memcache\Redis
+occ config:system:get dbhost              # 100.64.0.2</code></pre>
+            <figure class="shot">
+                <img src="img/nc-occ-status.png" alt="Výstup occ status, nastavení zamykání a adresa databáze" class="zoomable" loading="lazy">
+                <figcaption>Nextcloud nainstalovaný, Redis a databáze na VM2</figcaption>
+            </figure>
+        </li>
+        <li>
+            <h3>Důvěra Nextcloudu v certifikát Caddy</h3>
+            <p>
+                Nextcloud ověřuje své nastavení i spojení s Collaborou požadavky na vlastní
+                HTTPS adresy. Proto dostal kořenový certifikát Caddy:
+            </p>
+<pre><code>occ security:certificates:import /tmp/caddy-root.crt
+occ maintenance:repair --include-expensive</code></pre>
+            <p>
+                Po opravách zmizela všechna varování k nastavení. Zůstala jen informační upozornění
+                a počet chyb v záznamu událostí, které vznikly během testů výpadků (nedostupná
+                databáze, antivirus a Collabora).
+            </p>
+            <figure class="shot">
+                <img src="img/nc-prehled.png" alt="Přehled administrace Nextcloudu bez varování" class="zoomable" loading="lazy">
+                <figcaption>Administrace → Přehled</figcaption>
+            </figure>
+        </li>
+    </ol>
+</section>
+
+<section id="antivir">
+    <h2>Antivirová kontrola přes VPN</h2>
+    <p>
+        Aplikace <strong>files_antivirus</strong> běží v režimu démona: každý nahraný soubor
+        posílá streamem na ClamAV na VM2. Pokud ClamAV najde virus, Nextcloud soubor odmítne.
+    </p>
+
+    <ol class="chain" aria-label="Cesta nahraného souboru">
+        <li class="chain-node">
+            <span class="node-title">Prohlížeč</span>
+            <span class="node-sub">nahrání souboru</span>
+        </li>
+        <li class="chain-link">HTTPS na Caddy</li>
+        <li class="chain-node">
+            <span class="node-title">Nextcloud na VM1</span>
+            <span class="node-sub">aplikace files_antivirus</span>
+        </li>
+        <li class="chain-link">WireGuard, TCP 3310, příkaz INSTREAM</li>
+        <li class="chain-node chain-server">
+            <span class="node-title">ClamAV na VM2</span>
+            <span class="node-sub">vrátí OK nebo název nalezeného viru</span>
+        </li>
+    </ol>
+
+<pre><code>occ app:install files_antivirus
+occ config:app:set files_antivirus av_mode --value=daemon
+occ config:app:set files_antivirus av_host --value=100.64.0.2
+occ config:app:set files_antivirus av_port --value=3310
+occ config:app:set files_antivirus av_infected_action --value=delete</code></pre>
+
+    <h3>Test souborem EICAR</h3>
+    <p>
+        EICAR je standardní neškodný testovací řetězec, který všechny antiviry hlásí jako
+        virus. Jeho nahrání Nextcloud odmítl, běžný soubor prošel. V logu ClamAV na VM2 je
+        vidět, že kontrola přišla z adresy VM1 v tunelu:
+    </p>
+<pre><code>instream(100.64.0.1@43060): Eicar-Signature FOUND</code></pre>
+    <figure class="shot">
+        <img src="img/eicar-browser.png" alt="Chybové hlášení Nextcloudu po nahrání souboru EICAR" class="zoomable" loading="lazy">
+        <figcaption>Nextcloud odmítl infikovaný soubor</figcaption>
+    </figure>
+    <figure class="shot">
+        <img src="img/clamav-found.png" alt="Log ClamAV na VM2 s nálezem Eicar-Signature" class="zoomable" loading="lazy">
+        <figcaption>Nález v logu ClamAV na VM2</figcaption>
+    </figure>
+</section>
+
+<section id="collabora">
+    <h2>Collabora Online na VM3</h2>
+    <p>
+        Collabora poslouchá jen na <code>100.64.0.3:9980</code>. Prohlížeč se k ní dostane
+        přes Caddy na VM1 jako <code>https://office.nextcloud.test</code>. Collabora naopak
+        přes tunel volá Nextcloud (protokol WOPI), aby si dokument stáhla a uložila.
+    </p>
+<pre><code># /opt/collabora/docker-compose.yml
+services:
+  collabora:
+    image: collabora/code:latest
+    restart: unless-stopped
+    cap_add:
+      - MKNOD
+    environment:
+      - aliasgroup1=https://cloud\.nextcloud\.test:443
+      - dictionaries=cs_CZ en_US
+      - extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:ssl.ssl_verification=false
+    extra_hosts:
+      - "cloud.nextcloud.test:100.64.0.1"
+    ports:
+      - "100.64.0.3:9980:9980"</code></pre>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th scope="col">Volba</th><th scope="col">Význam</th></tr></thead>
+            <tbody>
+                <tr><td><code>aliasgroup1</code></td><td>dokumenty smí otevírat jen náš Nextcloud</td></tr>
+                <tr><td><code>ssl.enable=false</code>, <code>ssl.termination=true</code></td><td>TLS řeší Caddy, uvnitř tunelu běží čisté HTTP</td></tr>
+                <tr><td><code>ssl.ssl_verification=false</code></td><td>certifikát Nextcloudu je od interní CA; s Let's Encrypt by volba odpadla</td></tr>
+                <tr><td><code>extra_hosts</code></td><td>doména Nextcloudu ukazuje přes tunel na VM1</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <h3>Propojení s Nextcloudem</h3>
+<pre><code>occ app:install richdocuments
+occ config:app:set richdocuments wopi_url --value=https://office.nextcloud.test
+occ config:app:set richdocuments public_wopi_url --value=https://office.nextcloud.test
+occ config:app:set richdocuments wopi_allowlist --value=100.64.0.0/24,172.20.0.0/24
+occ richdocuments:activate-config</code></pre>
+    <p>
+        Poslední příkaz ověřil celou cestu a detekoval
+        <strong>Collabora Online Development Edition 26.04.4.2</strong>.
+        <code>wopi_allowlist</code> omezuje, odkud smí přicházet požadavky WOPI: jen z tunelu
+        a z Docker sítě na VM1.
+    </p>
+    <figure class="shot">
+        <img src="img/collabora-activate.png" alt="Výstup richdocuments:activate-config se všemi kontrolami úspěšně" class="zoomable" loading="lazy">
+        <figcaption>Nextcloud Office úspěšně propojený s Collaborou</figcaption>
+    </figure>
+    <figure class="shot">
+        <img src="img/collabora-editor.png" alt="Tabulka test.xlsx otevřená v editoru Collabora v Nextcloudu" class="zoomable" loading="lazy">
+        <figcaption>Tabulka otevřená v Collaboře přímo v Nextcloudu</figcaption>
+    </figure>
+
+    <h3>Zátěž na VM3</h3>
+    <p>Měření <code>docker stats</code> na VM3 ukazuje, že renderování opravdu běží tam:</p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th scope="col">Stav</th><th scope="col">CPU</th><th scope="col">Paměť</th><th scope="col">Procesy</th></tr></thead>
+            <tbody>
+                <tr><td>Bez otevřeného dokumentu</td><td>0,19 %</td><td>345 MiB</td><td>17</td></tr>
+                <tr><td>Otevřená tabulka, editace dvou uživatelů</td><td>3,58 %</td><td>380 MiB</td><td>20</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <p>
+        Pro otevřený dokument Collabora spustila nové procesy a vzrostla jí paměť. VM1 mezitím
+        jen předává provoz.
+    </p>
+    <figure class="shot">
+        <img src="img/docker-stats.png" alt="Výstup docker stats na VM3 v klidu a při editaci" class="zoomable" loading="lazy">
+        <figcaption>docker stats na VM3: první výpis v klidu, druhý při editaci</figcaption>
+    </figure>
+</section>
+
+<section id="testy">
+    <h2>Testy</h2>
+
+    <h3>Souběžná editace</h3>
+    <p>
+        Tabulku <code>test.xlsx</code> jsem sdílel druhému uživateli a otevřel ji ve dvou
+        oknech prohlížeče najednou. V editoru admina je vidět kurzor se jmenovkou
+        <em>Uživatel 2</em> a v záhlaví avatary obou uživatelů. Změny se v obou oknech
+        objevují v reálném čase.
+    </p>
+    <figure class="shot">
+        <img src="img/coediting.png" alt="Stejná tabulka otevřená dvěma uživateli vedle sebe" class="zoomable" loading="lazy">
+        <figcaption>Admin a druhý uživatel ve stejné tabulce</figcaption>
+    </figure>
+
+    <h3>Zamykání souborů v Redisu</h3>
+    <p>
+        Během dvou souběžných nahrávání téhož souboru přes WebDAV jsem na VM1 sledoval
+        příkazy, které dostává Redis na VM2 (<code>redis-cli monitor</code>):
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th scope="col">Příkaz v Redisu</th><th scope="col">Význam</th></tr></thead>
+            <tbody>
+                <tr><td><code>…/lockfiles/&lt;hash&gt;</code></td><td>klíč zámku konkrétního souboru</td></tr>
+                <tr><td><code>INCRBY … 1</code></td><td>sdílený zámek pro čtení, může jich být víc</td></tr>
+                <tr><td><code>SET … nx</code>, <code>"exclusive"</code></td><td>exkluzivní zámek pro zápis, uspěje jen první</td></tr>
+                <tr><td><code>EXPIRE … 3600</code></td><td>pojistka, zámek po hodině sám vyprší</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <p>
+        Požadavky přicházely ze dvou spojení z adresy <code>100.64.0.1</code>, tedy z VM1
+        přes tunel, a oba sahaly na stejné klíče. Výpis ukazuje celý životní cyklus zámku:
+        nejdřív sdílený zámek (<code>INCRBY</code>), pak jeho povýšení na exkluzivní
+        (<code>SET … nx</code>) a po dokončení zápisu uvolnění (<code>DECRBY</code>,
+        <code>del</code>). Druhé spojení získalo exkluzivní zámek na stejný soubor až po
+        uvolnění prvního, zápisy se tedy seřadily za sebe. Kdyby se potkaly ve stejném
+        okamžiku, druhý by dostal odpověď <code>423 Locked</code> místo toho, aby přepsal
+        rozepsaný soubor.
+    </p>
+    <figure class="shot">
+        <img src="img/redis-monitor.png" alt="Výpis redis-cli monitor se zámky souborů" class="zoomable" loading="lazy">
+        <figcaption>Zámky souborů v Redisu na VM2</figcaption>
+    </figure>
+
+    <h3>Výpadky jednotlivých vrstev</h3>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th scope="col">Test</th><th scope="col">Soubory</th><th scope="col">Editace dokumentů</th></tr></thead>
+            <tbody>
+                <tr><td>Zastavená Collabora na VM3</td><td><span class="state state-ok">fungují</span></td><td><span class="state state-bad">nedostupná</span></td></tr>
+                <tr><td>Zastavený ClamAV na VM2</td><td><span class="state state-bad">nahrávání odmítnuto</span></td><td><span class="state state-ok">funguje</span></td></tr>
+                <tr><td>Zastavený tunel a backend na VM2</td><td><span class="state state-bad">nedostupné</span></td><td><span class="state state-bad">nedostupná</span></td></tr>
+                <tr><td>Přerušený spoj VM1 ↔ VM2</td><td><span class="state state-bad">nedostupné</span></td><td><span class="state state-bad">nedostupná</span></td></tr>
+            </tbody>
+        </table>
+    </div>
+    <p>
+        Výpadek renderovací VM nezastaví sdílení souborů, zatímco backend je pro celý systém
+        kritický. Při nedostupném antiviru Nextcloud nahrávání odmítl s hlášením
+        <em>No connection to anti virus</em>. To je bezpečné chování: soubor, který nebylo možné
+        zkontrolovat, se do cloudu nedostane. Po obnovení služeb se Nextcloud vzpamatoval sám,
+        bez zásahu.
+    </p>
+    <figure class="shot">
+        <img src="img/test-collabora-down.png" alt="Nextcloud funguje, otevření dokumentu hlásí chybu" class="zoomable" loading="lazy">
+        <figcaption>Výpadek Collabory</figcaption>
+    </figure>
+    <figure class="shot">
+        <img src="img/test-clamav-down.png" alt="Chování Nextcloudu při nahrávání s vypnutým ClamAV" class="zoomable" loading="lazy">
+        <figcaption>Výpadek antiviru</figcaption>
+    </figure>
+    <figure class="shot">
+        <img src="img/test-backend-down.png" alt="Chybová stránka Nextcloudu bez databáze" class="zoomable" loading="lazy">
+        <figcaption>Výpadek backendu</figcaption>
+    </figure>
+
+    <h3>Čistý výpadek síťového spoje</h3>
+    <p>
+        Při zastavení tunelu na VM2 se kvůli závislosti zastaví i Docker, výpadek sítě
+        a služeb tak splyne. Proto jsem udělal i test, kde se přeruší jen spoj VM1 ↔ VM2
+        a služby na VM2 běží dál. Průběh ukazuje souběžně běžící ping:
+    </p>
+<pre><code>ping -O 100.64.0.2                                    # v jednom panelu tmuxu
+
+sudo wg set wg0 peer &lt;klíč VM2&gt; remove               # přerušení spoje
+
+sudo wg set wg0 peer &lt;klíč VM2&gt; \                     # obnovení bez restartu
+  endpoint 192.168.0.229:51820 allowed-ips 100.64.0.2/32 persistent-keepalive 25</code></pre>
+    <p>
+        Peer se vrací přímo příkazem <code>wg set</code>, takže se nerestartuje rozhraní
+        ani Docker s Nextcloudem.
+    </p>
+    <p>
+        Během výpadku hlásí ping <code>Required key not available</code>: WireGuard pro cílovou
+        adresu nezná žádný peer, a paket proto vůbec neodešle. Po vrácení peeru odpovědi
+        naskočily hned v další sekundě, ztraceno bylo 15 paketů, tedy zhruba 15 sekund výpadku.
+    </p>
+    <aside class="callout">
+        <p>
+            Původně jsem pro obnovení použil <code>wg syncconf</code> s konfigurací ze souboru.
+            Ten ale nastaví rozhraní přesně podle souboru, a protože privátní klíč se načítá
+            přes <code>PostUp</code> a v souboru není, syncconf ho z rozhraní smazal. VM1 pak
+            nenavázala tunel s nikým. Oprava: <code>wg set wg0 private-key /etc/wireguard/private.key</code>.
+        </p>
+    </aside>
+    <figure class="shot">
+        <img src="img/test-ping.png" alt="Výpis pingu s přerušenou a obnovenou řadou odpovědí" class="zoomable" loading="lazy">
+        <figcaption>Ping během přerušení a obnovení spoje</figcaption>
+    </figure>
+</section>
+
+<section id="problemy">
+    <h2>Problémy a jejich řešení</h2>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th scope="col">Problém</th><th scope="col">Příčina</th><th scope="col">Řešení</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>Docker se nenainstaloval, chyba 404</td>
+                    <td>na Ubuntu byl přidaný repozitář pro Debian</td>
+                    <td>repozitář <code>linux/ubuntu</code> pro vydání <code>noble</code></td>
+                </tr>
+                <tr>
+                    <td>Tunel z VM1 nenavázal spojení</td>
+                    <td>překlep ve veřejném klíči; tcpdump ukázal jen úvodní zprávy handshaku (148 B), žádnou odpověď (92 B)</td>
+                    <td>klíče kopírované jako text a ověřené otiskem <code>md5sum</code></td>
+                </tr>
+                <tr>
+                    <td>Po chybě v konfiguraci tunelu přestal běžet Nextcloud</td>
+                    <td>závislost Dockeru na WireGuardu zastavila kontejnery</td>
+                    <td>oprava konfigurace a <code>systemctl start docker</code></td>
+                </tr>
+                <tr>
+                    <td>Varování HSTS v administraci, i když hlavička existovala</td>
+                    <td>Nextcloud ověřuje sám sebe zevnitř kontejneru, kde doména neexistovala a CA Caddy nebyla důvěryhodná</td>
+                    <td>síťové aliasy u Caddy a import kořenového certifikátu</td>
+                </tr>
+                <tr>
+                    <td>Import certifikátu „could not get parsed“</td>
+                    <td>soubor s právy <code>600</code> nemohl číst uživatel <code>www-data</code></td>
+                    <td><code>chmod 644</code> a změna vlastníka v kontejneru</td>
+                </tr>
+                <tr>
+                    <td>Po testu výpadku se VM1 nespojila s ostatními, Nextcloud hlásil timeout databáze</td>
+                    <td><code>wg syncconf</code> smazal z rozhraní privátní klíč, který v souboru není</td>
+                    <td><code>wg set wg0 private-key /etc/wireguard/private.key</code></td>
+                </tr>
+                <tr>
+                    <td>Collabora na nepřiděleném virtuálu</td>
+                    <td>omylem použitý jiný stroj místo VM č. 44</td>
+                    <td>nová instalace na správné VM a výměna peeru na VM1 a VM2 příkazem <code>sed</code></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section id="rozsireni">
+    <h2>Možná rozšíření</h2>
+    <ul>
+        <li>veřejná doména a certifikát Let's Encrypt místo interní CA,</li>
+        <li>pravidelné zálohy databáze a dat Nextcloudu, například přes <code>mariadb-dump</code> a systemd timer,</li>
+        <li>SMTP server pro e-mailová upozornění a obnovu hesla,</li>
+        <li>vynucení dvoufázového ověření pro všechny uživatele,</li>
+        <li>monitoring všech tří virtuálů Zabbixem,</li>
+        <li>víc instancí Collabory za vyvažovačem zátěže pro větší počet uživatelů.</li>
+    </ul>
+</section>
+
+<section id="zaver">
+    <h2>Závěr</h2>
+    <p>
+        Na třech přidělených virtuálech běží funkční osobní cloud. Nextcloud na VM1 je
+        dostupný přes HTTPS za proxy Caddy, databáze, zamykání souborů a antivirus běží na VM2
+        a náročné renderování dokumentů obstarává Collabora na VM3. Všechny vnitřní služby
+        jsou dostupné jen v tunelu WireGuard.
+    </p>
+    <p>
+        Testy potvrdily všechny body zadání: infikovaný soubor zachytil ClamAV na VM2,
+        tabulku editovali dva uživatelé současně v Collaboře na VM3, Redis hlídal zámky
+        souborů a výpadek renderovací vrstvy neohrozil sdílení souborů.
+    </p>
+    <p>
+        Projekt mi ukázal, jak závisí jednotlivé vrstvy na síti mezi nimi, proč je důležité
+        navazovat služby jen na vnitřní adresy a jak ladit šifrovaný tunel, když na první
+        pohled „nic nefunguje“.
+    </p>
+</section>
+
+</main>
+</div>
+
+<div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Zvětšený obrázek" hidden>
+    <button type="button" class="lightbox-close" aria-label="Zavřít">&times;</button>
+    <img id="lightbox-img" alt="">
+    <p id="lightbox-caption" class="lightbox-caption"></p>
+</div>
+
+<footer>
+    <p>© 2026 Jan, semestrální projekt: osobní cloud Nextcloud na třech virtuálech</p>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
